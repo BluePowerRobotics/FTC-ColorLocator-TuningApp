@@ -1,0 +1,1 @@
+"""色块分割调参应用（ColorBlobLocator 桌面调参工具）。"""
