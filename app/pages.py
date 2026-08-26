@@ -12,11 +12,14 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
 from . import config as C
 from . import codegen
 from . import pipeline as P
+from .camera import enumerate_cameras
 from .widgets import ImageView, OptionBox, SliderSpin, ThresholdGroupCard
 
 
@@ -35,6 +39,30 @@ def _bgr2rgb(img):
     if img is None:
         return None
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def _make_split(parent, widgets, ratios, orientation):
+    """把 widgets 放入可拖动分界线的 QSplitter，并设为 parent 的布局。"""
+    splitter = QSplitter(orientation)
+    for w in widgets:
+        splitter.addWidget(w)
+    total = 1200 if orientation == Qt.Horizontal else 800
+    unit = total // max(1, sum(ratios))
+    splitter.setSizes([r * unit for r in ratios])
+    for i, r in enumerate(ratios):
+        splitter.setStretchFactor(i, r)
+    splitter.setChildrenCollapsible(False)
+    lay = QHBoxLayout(parent) if orientation == Qt.Horizontal else QVBoxLayout(parent)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(splitter)
+
+
+def _h_split(parent, widgets, ratios):
+    _make_split(parent, widgets, ratios, Qt.Horizontal)
+
+
+def _v_split(parent, widgets, ratios):
+    _make_split(parent, widgets, ratios, Qt.Vertical)
 
 
 def _clear_layout(layout):
@@ -115,6 +143,9 @@ def _gradient(t, anchors):
 _RANK_ANCHORS = [(0.0, (0, 255, 0)), (0.33, (0, 255, 255)), (0.66, (0, 80, 255)), (1.0, (170, 0, 255))]
 
 
+_MIN_LABEL_AREA_RATIO = 0.1  # 排名数字标注的面积比例阈值（相对最大色块，低于则不标注）
+
+
 def _rank_color(rank, total):
     if total <= 1:
         t = 0.0
@@ -185,6 +216,11 @@ class UploadPage(Page):
             "- 先用静态图片调参，再用摄像头微调。",
             "- 摄像头模式下可“冻结画面”精细调参。",
             "- 选择图片或打开摄像头后自动进入第 1 页。",
+            "# 文件管理",
+            "- 顶部栏左侧的「文件」菜单与按钮，可把当前整组参数（全局配置 + 各 Processor）保存为 .clp 文件随时复用。",
+            "- 打开：载入 .clp 文件并覆盖当前参数；保存：写回当前文件；另存为：另存为新文件。",
+            "- 打开并合并：把文件中的 Processor 追加为新 Processor，不覆盖已有参数；合并时分辨率取两者较大。",
+            "- 另存并合并到：把当前 Processor 追加进所选文件，不覆盖该文件已有参数，保存后自动打开合并结果。",
             "# 什么是色块分割",
             "- 把图像中符合某种颜色范围的区域（blob，色块）找出来，输出它的位置、大小、形状与若干指标，",
             "  供机器人在画面中定位目标物体。",
@@ -215,9 +251,7 @@ class UploadPage(Page):
         cv.addWidget(self.thumb, 1)
         cv.addStretch(0)
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(center, 1)
-        lay.addWidget(self.tutorial_panel, 1)
+        _h_split(self, [center, self.tutorial_panel], [1, 1])
 
         self.btn_image.clicked.connect(self._pick_image)
         self.btn_camera.clicked.connect(self._open_camera)
@@ -235,7 +269,19 @@ class UploadPage(Page):
         self.controller.set_image(img)
 
     def _open_camera(self):
-        self.controller.start_camera()
+        # 先释放当前摄像头，避免再次枚举时与占用中的设备冲突导致界面卡死
+        self.controller._stop_camera()
+        devices = enumerate_cameras()
+        if not devices:
+            QMessageBox.warning(self, "摄像头", "未检测到可用摄像头。")
+            return
+        if len(devices) == 1:
+            self.controller.start_camera(devices[0].index)
+            return
+        labels = [f"摄像头 {d.index}（{d.width}×{d.height}）" for d in devices]
+        label, ok = QInputDialog.getItem(self, "选择摄像头", "检测到多个摄像头，请选择：", labels, 0, False)
+        if ok:
+            self.controller.start_camera(devices[labels.index(label)].index)
 
     def refresh(self):
         img = self.controller.image
@@ -276,15 +322,16 @@ class PreprocessPage(Page):
         lv.addWidget(_params_scroll(params), 1)
         lv.addWidget(self.tutorial_panel)
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(left, 1)
-        lay.addWidget(self.view, 3)
+        _h_split(self, [left, self.view], [1, 3])
 
         self.rate.value_changed.connect(self._on_change)
 
     def _on_change(self, _v):
         self.controller.global_cfg.downsample_rate = int(self.rate.value())
         self.controller.on_param_changed()
+
+    def rebuild_params(self):
+        self.rate.set_value_silent(self.controller.global_cfg.downsample_rate)
 
     def refresh(self):
         res = self.controller.result
@@ -353,9 +400,7 @@ class RoiPage(Page):
         lv.addWidget(_params_scroll(params), 1)
         lv.addWidget(self.tutorial_panel)
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(left, 1)
-        lay.addWidget(right, 3)
+        _h_split(self, [left, right], [1, 3])
 
     # --- 参数重建 ---
     def rebuild_params(self):
@@ -501,9 +546,7 @@ class DenoisePage(Page):
         lv.addWidget(_params_scroll(params), 1)
         lv.addWidget(self.tutorial_panel)
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(left, 1)
-        lay.addWidget(right, 3)
+        _h_split(self, [left, right], [1, 3])
 
     def rebuild_params(self):
         _clear_layout(self.groups_vbox)
@@ -614,9 +657,7 @@ class ColorRangePage(Page):
         lv.addWidget(_params_scroll(params), 1)
         lv.addWidget(self.tutorial_panel)
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(left, 1)
-        lay.addWidget(right, 3)
+        _h_split(self, [left, right], [1, 3])
 
     def rebuild_params(self):
         _clear_layout(self.groups_vbox)
@@ -767,9 +808,7 @@ class PostprocessPage(Page):
         lv.addWidget(_params_scroll(params), 1)
         lv.addWidget(self.tutorial_panel)
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(left, 1)
-        lay.addWidget(right, 3)
+        _h_split(self, [left, right], [1, 3])
 
     def rebuild_params(self):
         _clear_layout(self.groups_vbox)
@@ -969,14 +1008,9 @@ class FilterSortPage(Page):
         rv.addWidget(self._status)
 
         left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.addWidget(_params_scroll(params), 1)
-        lv.addWidget(self.code_box)
-        lv.addWidget(self.tutorial_panel)
+        _v_split(left, [_params_scroll(params), self.code_box, self.tutorial_panel], [3, 2, 2])
 
-        lay = QHBoxLayout(self)
-        lay.addWidget(left, 1)
-        lay.addWidget(right, 3)
+        _h_split(self, [left, right], [1, 3])
 
         self.sort_criterion.changed.connect(self._on_global)
         self.sort_order.changed.connect(self._on_global)
@@ -990,6 +1024,10 @@ class FilterSortPage(Page):
         self.controller.on_param_changed()
 
     def rebuild_params(self):
+        gc = self.controller.global_cfg
+        self.sort_criterion.set_value(gc.sort_criterion, silent=True)
+        self.sort_order.set_value(gc.sort_order, silent=True)
+        self.fit_mode.set_value(gc.fit_mode, silent=True)
         _clear_layout(self.groups_vbox)
         self._groups = []
         for i, proc in enumerate(self.controller.processors):
@@ -1114,6 +1152,7 @@ class FilterSortPage(Page):
 
         active = self._active_blob()
         total = sum(1 for b in res.merged_blobs if not b.filtered)
+        max_area = max((b.area for b in res.merged_blobs if not b.filtered), default=0.0)
         # 高亮当前色块（悬停或默认排名第一），黄色粗轮廓 + 拟合形状
         if active is not None:
             cv2.drawContours(rgb, [active.contour], -1, (0, 255, 255), self._line_width(3))
@@ -1126,6 +1165,9 @@ class FilterSortPage(Page):
             else:
                 color = _rank_color(b.rank, total)
                 cv2.drawContours(rgb, [b.contour], -1, color, self._line_width(2))
+                # 排名数字：高亮色块不标、面积过小不标，其余标注在拟合轮廓中心
+                if b.area >= _MIN_LABEL_AREA_RATIO * max_area:
+                    self._draw_rank_label(rgb, b, color)
 
         # 裁剪到 ROI 并集
         return rgb[y:y + h, x:x + w]
@@ -1144,6 +1186,19 @@ class FilterSortPage(Page):
             cv2.circle(rgb, (int(cx), int(cy)), int(r), (0, 0, 255), t)
         # 一并绘出中心点（实心红点）
         cv2.circle(rgb, (int(cx), int(cy)), dot_r, (0, 0, 255), -1)
+
+    def _draw_rank_label(self, rgb, b, color):
+        """在拟合轮廓中心标注排名数字（黑色描边保证对比度 + 排名色填充）。"""
+        if self.controller.global_cfg.fit_mode == C.FIT_BOX:
+            cx, cy = b.rect[0]
+        else:
+            cx, cy, _ = b.circle
+        text = str(b.rank)
+        org = (int(cx) - 6, int(cy) + 6)
+        cv2.putText(rgb, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 0, 0), self._line_width(3), cv2.LINE_AA)
+        cv2.putText(rgb, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    color, self._line_width(1), cv2.LINE_AA)
 
     def refresh(self):
         res = self.controller.result

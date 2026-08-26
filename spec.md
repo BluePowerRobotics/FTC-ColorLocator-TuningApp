@@ -37,7 +37,7 @@ FTC SDK 内置 `ColorBlobLocatorProcessor`（以下简称 CBLP）的各项参数
 main.py                    # 程序入口，创建 QApplication 与 MainWindow
 app/
   __init__.py
-  config.py                # 配置数据模型与所有常量
+  config.py                # 配置数据模型、常量与 .clp 参数文件序列化/合并/读写
   pipeline.py              # 核心视觉处理管道（纯 OpenCV/NumPy，无 Qt 依赖）
   codegen.py               # 生成 FTC Java 代码
   camera.py                # 摄像头采集（线程抓帧）
@@ -134,6 +134,20 @@ app/
 > `ProcessorConfig`；**全局性参数**（降采样率、排序、拟合、教学模式、页码）放在
 > `GlobalConfig`。
 
+### 4.5 序列化与文件读写（.clp 参数文件）
+
+- 常量：`FILE_EXT = ".clp"`、`FILE_FILTER = "调参文件 (*.clp)"`。
+- `state_to_dict(global_cfg, processors) -> dict`：扁平 JSON 结构
+  `{"format_version": 1, "global": 4 个调参字段, "processors": [asdict(p)…]}`，
+  排除运行时字段 `teaching_mode`/`page_index`。
+- `state_from_dict(data) -> (GlobalConfig, list[ProcessorConfig])`：缺失字段用默认值回退、
+  阈值/尺寸转类型、`processors` 为空回退 `[default_processor(1)]`。
+- `merge_processors(existing, incoming)`：以 `existing` 为宿主追加 `incoming`，
+  名字冲突自动加 `_2/_3/…` 后缀（先 `clone` 深拷贝再改名）。
+- `merge_global(host, guest)`：合并时取较大分辨率（`min(downsample_rate)`），其余沿用宿主。
+- `save_state_file(path, …)`：先写 `path + ".tmp"` 再 `os.replace` 原子替换。
+- `load_state_file(path)`：读 JSON → `state_from_dict`。
+
 ---
 
 ## 5. 视觉管道（pipeline.py）
@@ -219,11 +233,13 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 
 ### 6.1 主窗口（MainWindow）
 - 标题「色块分割调参应用」，尺寸 1200×800。
-- 顶部栏：`教学模式`按钮、步骤标签（居中）、`冻结画面`按钮（仅摄像头模式显示）、
-  `上一步/下一步`。
+- 顶部栏左侧依次：`文件`（下拉菜单按钮）、`打开`、`保存`、`另存为`、`教学模式`；
+  中间为步骤标签；右侧为 `冻结画面`（仅摄像头模式显示）、`上一步/下一步`。
+- `文件`菜单（`InstantPopup`）自上而下：打开 / 打开并合并 / 保存 / 另存为 / 另存并合并到；
+  其中「打开并合并」「另存并合并到」仅能经菜单进入。
 - 主体：`QStackedWidget` 承载 7 个页面。
-- 持有状态：`global_cfg`、`processors`（至少 1 个）、`image`（BGR）、`result`、
-  `camera`、`camera_mode`、`frozen`。
+- 持有状态：`global_cfg`、`processors`（至少 1 个）、`current_file_path`（当前 `.clp` 路径，
+  初始 `None`）、`image`（BGR）、`result`、`camera`、`camera_mode`、`frozen`。
 
 **时序（防抖）**：
 - 参数变化统一走 `on_param_changed()` → 启动**单次 30ms** 定时器 → 到点执行
@@ -241,9 +257,22 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 
 **关闭**：`closeEvent` 先 `_stop_camera()` 释放摄像头。
 
+**文件操作**（`config.py` 序列化 + `main_window.py` 对话框）：
+- `open_file()`：选 `.clp` → 覆盖 `global_cfg`/`processors` → 设 `current_file_path` → `_apply_loaded_state()`。
+- `open_merge()`：选文件 → 把其处理器经 `merge_processors` 追加为**新 Processor**，全局经
+  `merge_global` 取较大分辨率（其余保留当前）；不改 `current_file_path`。仅菜单。
+- `save_file()`：`current_file_path` 有值则原地写，否则转 `save_file_as()`。
+- `save_file_as()`：另存为 `.clp`（默认名 `color_params.clp`、缺后缀自动补），成功后更新 `current_file_path`。
+- `save_merge_to()`：选已有 `.clp` → 全局经 `merge_global` 取较大分辨率（其余保留该文件）、把当前处理器
+  追加进文件并原子写回 → 将合并结果加载为当前状态。仅菜单。
+- 加载后统一 `_apply_loaded_state()`：页面 1 同步降采样率、页面 2..6 重建参数组 → `_run_pipeline()`。
+
 ### 6.2 向导页面（7 页，`PAGE_CLASSES`）
 
-每个页面左侧为参数面板 + 教程面板（教学模式控制可见性），右侧为图像预览。
+每个页面左侧为参数面板 + 教程面板（教学模式控制可见性），右侧为图像预览。左右分栏由水平
+`QSplitter` 承载，页面 0 初始 1:1、页面 1~6 初始 1:3；页面 6 左侧的「调参/代码/教程」三块由
+垂直 `QSplitter` 承载（初始 3:2:2）。所有分栏交界处均可拖动改变大小，且 `setChildrenCollapsible(False)`
+防止被拖坍缩为零宽度/高度。
 
 | 索引 | 页面 | 关键参数/控件 | 预览内容 |
 |------|------|--------------|---------|
@@ -267,6 +296,9 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
   `YCrCb / RGB / HSV` 三组数值及当前 mask 判定（是否命中目标），便于抄录阈值。
 - **色块悬停高亮**（页面 6）：悬停命中色块放大黄色粗轮廓；否则默认高亮排名第一的色块。
   未过滤色块按排名使用绿→青→蓝→紫渐变，被过滤者用灰线。
+- **排名数字标注**（页面 6）：在每个未过滤色块的拟合轮廓中心（`boxFit` 旋转矩形中心 /
+  `circleFit` 外接圆圆心）用「排名色填充 + 黑色描边」绘制排名数字（`_draw_rank_label`）；
+  被高亮拟合的色块、以及面积不足 `0.1 × 最大色块面积`（`_MIN_LABEL_AREA_RATIO`）的小色块不标数字。
 - **拟合绘制**：`boxFit` 画 `cv2.boxPoints` 旋转矩形；`circleFit` 画外接圆；均叠加中心点。
 - **线条粗细自适应**：轮廓线宽随降采样率等比例缩小，保证与原图视觉比例一致。
 
@@ -284,9 +316,14 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 ### 6.5 输入源（camera.py + main_window.py）
 - 图片：`QFileDialog` + `cv2.imread` 改为 **`cv2.imdecode`** 读取字节流，以兼容 Windows
   上含中文/非 ASCII 的路径。
-- 摄像头：`Camera` 用 `cv2.VideoCapture(0, CAP_DSHOW)`（失败回退默认后端），分辨率
-  1280×720，**独立 daemon 线程**持续读帧、用锁保护、`latest_frame()` 返回副本。
+- 摄像头：`Camera` 可**按索引打开**，`CAP_DSHOW` 优先、失败回退默认后端，并**默认使用
+  最大分辨率**（`_max_resolution` 设超大值读回驱动钳制结果，读取失败回退 1280×720）。
+  **独立 daemon 线程**持续读帧、用锁保护、`latest_frame()` 返回副本。
   支持「冻结画面」冻结当前帧进行精细调参。
+- 摄像头选择：`enumerate_cameras()` 遍历索引 0~7（`CAP_DSHOW` 优先）返回可用设备与最大分辨率。
+  打开摄像头时——无设备则 `QMessageBox` 警告；仅 1 个则直接打开；多个则 `QInputDialog` 弹出
+  选择框（显示「摄像头 N（宽×高）」），选定后 `start_camera(index)` 打开对应设备；
+  再次点击「打开摄像头」前会先 `_stop_camera()` 释放旧设备，避免枚举时与占用中的摄像头并发打开而卡死。
 - 选图或开摄像头后自动跳转到第 1 页。
 
 ### 6.6 教学模式
@@ -336,6 +373,17 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 11. **`cv2.imdecode` 读图**兼容非 ASCII 路径（Windows 常见问题）。
 12. **代码框去抖**：`_set_code` 在文本不变时跳过 `setPlainText`，避免实时刷新反复重置滚动位置。
 13. **最少 1 个 Processor**：删除到只剩 1 个时不可再删。
+14. **参数持久化用 `.clp` 单文件**，内容为 JSON（UTF-8、缩进 2、`format_version=1`），
+    排除运行时态 `teaching_mode`/`page_index`。
+15. **合并语义（宿主保留全局、客人只贡献处理器；分辨率取大）**：「打开并合并」宿主 = 当前内存态；
+    「另存并合并到」宿主 = 所选文件（写回后加载）。两文件合并时 `downsample_rate` 取两者较小值
+    （即较大分辨率），其余全局沿用宿主。名字冲突自动重命名 `_2/_3`。
+16. **`save_state_file` 原子写入**：先写 `path + ".tmp"` 再 `os.replace`，避免中断损坏目标文件。
+17. **布局分栏用 `QSplitter`**：水平分栏（页面 0 为 1:1、页面 1~6 为 1:3）+ 页面 6 左侧垂直分栏
+    （调参/代码/教程 3:2:2），统一由 `_make_split`/`_h_split`/`_v_split` 助手创建并
+    `setChildrenCollapsible(False)`。
+18. **排名数字标注面积阈值**：`_MIN_LABEL_AREA_RATIO = 0.1`，面积不足最大色块 10% 的色块不标数字，
+    高亮拟合色块亦不标；轮廓排名配色保留不变。
 
 ---
 
@@ -343,5 +391,5 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 
 - 颜色查找与 CBLP 语义对齐，但不支持 Lab/HSL/HLS 等官方不支持的空间（见 `ColorLocator.md`）。
 - 预定义颜色是近似标定，可能与真机官方常量存在细微差异。
-- 程序当前仅实现「描述现有功能」的规格；无持久化（参数不保存到文件）、无历史/撤销。
-- 摄像头固定为默认摄像头（index 0），无设备选择、无分辨率选择 UI（代码写死 1280×720）。
+- 参数可手动保存/加载为 `.clp` 文件（JSON），但无自动保存、无历史/撤销。
+- 摄像头默认使用最大分辨率（读回失败回退 1280×720）；无手动分辨率选择 UI，选择框仅显示索引（0~7 枚举）而非设备名。

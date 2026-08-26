@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import json
+import os
+from dataclasses import dataclass, field, replace, asdict
 from typing import List
 
 # ---------------------------------------------------------------------------
@@ -130,3 +132,109 @@ class GlobalConfig:
     sort_criterion: str = "BY_CONTOUR_AREA"
     sort_order: str = "DESCENDING"
     fit_mode: str = FIT_CIRCLE
+
+
+# ---------------------------------------------------------------------------
+# 序列化 / 合并 / 文件读写（.clp 参数文件，内容为 JSON）
+# ---------------------------------------------------------------------------
+
+FILE_EXT = ".clp"
+FILE_FILTER = "调参文件 (*.clp)"
+
+
+def state_to_dict(global_cfg: GlobalConfig, processors) -> dict:
+    """把整组参数转为可 JSON 化的扁平字典（排除 teaching_mode/page_index 运行时态）。"""
+    return {
+        "format_version": 1,
+        "global": {
+            "downsample_rate": global_cfg.downsample_rate,
+            "sort_criterion": global_cfg.sort_criterion,
+            "sort_order": global_cfg.sort_order,
+            "fit_mode": global_cfg.fit_mode,
+        },
+        "processors": [asdict(p) for p in processors],
+    }
+
+
+def state_from_dict(data: dict):
+    """从字典重建 (GlobalConfig, list[ProcessorConfig])，缺失字段用默认值回退。"""
+    data = data if isinstance(data, dict) else {}
+    g = data.get("global") if isinstance(data.get("global"), dict) else {}
+    global_cfg = GlobalConfig(
+        downsample_rate=int(g.get("downsample_rate", 1)),
+        sort_criterion=g.get("sort_criterion", "BY_CONTOUR_AREA"),
+        sort_order=g.get("sort_order", "DESCENDING"),
+        fit_mode=g.get("fit_mode", FIT_CIRCLE),
+    )
+
+    raw = data.get("processors") or []
+    processors = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        rules = [
+            FilterRule(
+                criterion=r.get("criterion", "BY_CONTOUR_AREA"),
+                min_value=float(r.get("min_value", 0.0)),
+                max_value=float(r.get("max_value", 0.0)),
+            )
+            for r in (p.get("filter_rules") or [])
+        ]
+        processors.append(
+            ProcessorConfig(
+                name=p.get("name", "Processor 1"),
+                roi_mode=p.get("roi_mode", ROI_ENTIRE),
+                roi_norm=[float(v) for v in (p.get("roi_norm") or [-1.0, 1.0, 1.0, -1.0])],
+                blur_size=int(p.get("blur_size", 5)),
+                preset=p.get("preset", "自定义"),
+                color_space=p.get("color_space", "YCrCb"),
+                lower=[int(v) for v in (p.get("lower") or [0, 0, 0])],
+                upper=[int(v) for v in (p.get("upper") or [255, 255, 255])],
+                erode_size=int(p.get("erode_size", 0)),
+                dilate_size=int(p.get("dilate_size", 0)),
+                morph_type=p.get("morph_type", MORPH_CLOSING),
+                contour_mode=p.get("contour_mode", CONTOUR_EXTERNAL),
+                filter_rules=rules,
+            )
+        )
+    if not processors:
+        processors = [default_processor(1)]
+    return global_cfg, processors
+
+
+def merge_processors(existing, incoming):
+    """以 `existing` 为宿主追加 `incoming`；名字冲突自动加 _2/_3 后缀保证唯一。"""
+    taken = {p.name for p in existing}
+    merged = list(existing)
+    for p in incoming:
+        cp = p.clone()
+        if cp.name in taken:
+            base = cp.name
+            i = 2
+            while f"{base}_{i}" in taken:
+                i += 1
+            cp.name = f"{base}_{i}"
+        taken.add(cp.name)
+        merged.append(cp)
+    return merged
+
+
+def merge_global(host: GlobalConfig, guest: GlobalConfig) -> GlobalConfig:
+    """合并全局配置：取较大分辨率（即较小 downsample_rate），其余沿用宿主。"""
+    return replace(host, downsample_rate=min(host.downsample_rate, guest.downsample_rate))
+
+
+def save_state_file(path, global_cfg, processors):
+    """原子写入参数文件：先写临时文件再 os.replace，避免写入中断损坏目标文件。"""
+    data = state_to_dict(global_cfg, processors)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_state_file(path):
+    """读取参数文件并重建 (GlobalConfig, list[ProcessorConfig])。"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return state_from_dict(data)

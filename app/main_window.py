@@ -5,12 +5,15 @@ from __future__ import annotations
 import cv2
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +40,30 @@ class MainWindow(QMainWindow):
         self.camera = None
         self.camera_mode = False
         self.frozen = False
+        self.current_file_path = None
+
+        # 文件操作（顶部栏左侧）
+        self.file_btn = QToolButton()
+        self.file_btn.setText("文件")
+        self.file_btn.setPopupMode(QToolButton.InstantPopup)
+        self.file_menu = QMenu(self.file_btn)
+        for _text, _slot in (
+            ("打开", self.open_file),
+            ("打开并合并", self.open_merge),
+            ("保存", self.save_file),
+            ("另存为", self.save_file_as),
+            ("另存并合并到", self.save_merge_to),
+        ):
+            _act = self.file_menu.addAction(_text)
+            _act.triggered.connect(_slot)
+        self.file_btn.setMenu(self.file_menu)
+
+        self.open_btn = QPushButton("打开")
+        self.open_btn.clicked.connect(self.open_file)
+        self.save_btn = QPushButton("保存")
+        self.save_btn.clicked.connect(self.save_file)
+        self.save_as_btn = QPushButton("另存为")
+        self.save_as_btn.clicked.connect(self.save_file_as)
 
         # 顶部栏
         self.teach_btn = QPushButton("教学模式 关")
@@ -58,6 +85,10 @@ class MainWindow(QMainWindow):
         top = QWidget()
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(8, 6, 8, 6)
+        top_lay.addWidget(self.file_btn)
+        top_lay.addWidget(self.open_btn)
+        top_lay.addWidget(self.save_btn)
+        top_lay.addWidget(self.save_as_btn)
         top_lay.addWidget(self.teach_btn)
         top_lay.addStretch(1)
         top_lay.addWidget(self.step_label)
@@ -152,11 +183,11 @@ class MainWindow(QMainWindow):
         self._run_pipeline()
         self.go_to_page(1)
 
-    def start_camera(self):
+    def start_camera(self, index: int = 0):
         if self.camera is None:
-            self.camera = Camera()
+            self.camera = Camera(index)
             if not self.camera.open():
-                QMessageBox.warning(self, "摄像头", "无法打开默认摄像头。")
+                QMessageBox.warning(self, "摄像头", "无法打开所选摄像头。")
                 self.camera = None
                 return
         self.camera_mode = True
@@ -239,6 +270,86 @@ class MainWindow(QMainWindow):
         page = self.pages[self.global_cfg.page_index]
         page.rebuild_params()
         page.refresh()
+
+    # ------------------------------------------------------------------
+    # 文件操作
+    # ------------------------------------------------------------------
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "打开", "", C.FILE_FILTER)
+        if not path:
+            return
+        try:
+            g, ps = C.load_state_file(path)
+        except Exception as e:
+            QMessageBox.warning(self, "打开", f"加载失败：{e}")
+            return
+        self.global_cfg = g
+        self.processors = ps
+        self.current_file_path = path
+        self._apply_loaded_state()
+
+    def open_merge(self):
+        path, _ = QFileDialog.getOpenFileName(self, "打开并合并", "", C.FILE_FILTER)
+        if not path:
+            return
+        try:
+            g, ps = C.load_state_file(path)
+        except Exception as e:
+            QMessageBox.warning(self, "打开并合并", f"加载失败：{e}")
+            return
+        self.global_cfg = C.merge_global(self.global_cfg, g)
+        self.processors = C.merge_processors(self.processors, ps)
+        self._apply_loaded_state()
+
+    def save_file(self):
+        if self.current_file_path is None:
+            self.save_file_as()
+            return
+        try:
+            C.save_state_file(self.current_file_path, self.global_cfg, self.processors)
+        except Exception as e:
+            QMessageBox.warning(self, "保存", f"保存失败：{e}")
+
+    def save_file_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "另存为", "color_params.clp", C.FILE_FILTER)
+        if not path:
+            return
+        if not path.endswith(C.FILE_EXT):
+            path += C.FILE_EXT
+        try:
+            C.save_state_file(path, self.global_cfg, self.processors)
+        except Exception as e:
+            QMessageBox.warning(self, "另存为", f"保存失败：{e}")
+            return
+        self.current_file_path = path
+
+    def save_merge_to(self):
+        path, _ = QFileDialog.getOpenFileName(self, "另存并合并到", "", C.FILE_FILTER)
+        if not path:
+            return
+        try:
+            g, exist_ps = C.load_state_file(path)
+        except Exception as e:
+            QMessageBox.warning(self, "另存并合并到", f"加载失败：{e}")
+            return
+        merged_global = C.merge_global(g, self.global_cfg)
+        merged = C.merge_processors(exist_ps, self.processors)
+        try:
+            C.save_state_file(path, merged_global, merged)
+        except Exception as e:
+            QMessageBox.warning(self, "另存并合并到", f"保存失败：{e}")
+            return
+        self.global_cfg = merged_global
+        self.processors = merged
+        self.current_file_path = path
+        self._apply_loaded_state()
+
+    def _apply_loaded_state(self):
+        # 页面 1：同步降采样率；页面 2..6：重建 Processor 参数组
+        self.pages[1].rebuild_params()
+        for i in (2, 3, 4, 5, 6):
+            self.pages[i].rebuild_params()
+        self._run_pipeline()
 
     # ------------------------------------------------------------------
     def closeEvent(self, e):
