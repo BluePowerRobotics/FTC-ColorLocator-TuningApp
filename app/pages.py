@@ -278,10 +278,12 @@ class UploadPage(Page):
         if len(devices) == 1:
             self.controller.start_camera(devices[0].index)
             return
-        labels = [f"摄像头 {d.index}（{d.width}×{d.height}）" for d in devices]
-        label, ok = QInputDialog.getItem(self, "选择摄像头", "检测到多个摄像头，请选择：", labels, 0, False)
+        entries = [(d.index, f"摄像头 {d.index}（{d.width}×{d.height}）") for d in devices]
+        label, ok = QInputDialog.getItem(self, "选择摄像头", "检测到多个摄像头，请选择：",
+                                         [e[1] for e in entries], 0, False)
         if ok:
-            self.controller.start_camera(devices[labels.index(label)].index)
+            idx = next(e[0] for e in entries if e[1] == label)
+            self.controller.start_camera(idx)
 
     def refresh(self):
         img = self.controller.image

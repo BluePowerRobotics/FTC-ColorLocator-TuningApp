@@ -142,6 +142,24 @@ FILE_EXT = ".clp"
 FILE_FILTER = "调参文件 (*.clp)"
 
 
+def ensure_odd(n: int) -> int:
+    """把 blurSize 规整为不小于 1 的奇数（OpenCV 高斯核要求奇数，偶数会抛异常）。"""
+    n = int(n)
+    if n < 1:
+        n = 1
+    if n % 2 == 0:
+        n += 1
+    return n
+
+
+def _fixed_list(vals, default, n, cast=float):
+    """把列表补齐/截断到长度 n：不足用 default 循环补齐，超出截断，杜绝损坏文件导致崩溃。"""
+    result = [cast(x) for x in (vals or default)]
+    if len(result) < n:
+        result += [cast(default[i % len(default)]) for i in range(len(result), n)]
+    return result[:n]
+
+
 def state_to_dict(global_cfg: GlobalConfig, processors) -> dict:
     """把整组参数转为可 JSON 化的扁平字典（排除 teaching_mode/page_index 运行时态）。"""
     return {
@@ -184,12 +202,12 @@ def state_from_dict(data: dict):
             ProcessorConfig(
                 name=p.get("name", "Processor 1"),
                 roi_mode=p.get("roi_mode", ROI_ENTIRE),
-                roi_norm=[float(v) for v in (p.get("roi_norm") or [-1.0, 1.0, 1.0, -1.0])],
-                blur_size=int(p.get("blur_size", 5)),
+                roi_norm=_fixed_list(p.get("roi_norm"), [-1.0, 1.0, 1.0, -1.0], 4),
+                blur_size=ensure_odd(int(p.get("blur_size", 5))),
                 preset=p.get("preset", "自定义"),
                 color_space=p.get("color_space", "YCrCb"),
-                lower=[int(v) for v in (p.get("lower") or [0, 0, 0])],
-                upper=[int(v) for v in (p.get("upper") or [255, 255, 255])],
+                lower=_fixed_list(p.get("lower"), [0, 0, 0], 3, cast=int),
+                upper=_fixed_list(p.get("upper"), [255, 255, 255], 3, cast=int),
                 erode_size=int(p.get("erode_size", 0)),
                 dilate_size=int(p.get("dilate_size", 0)),
                 morph_type=p.get("morph_type", MORPH_CLOSING),
@@ -233,8 +251,54 @@ def save_state_file(path, global_cfg, processors):
     os.replace(tmp, path)
 
 
+def _validate_state(data) -> None:
+    """校验参数文件结构是否损坏/版本不兼容；损坏时抛 ValueError（由调用方弹窗提示）。"""
+    if not isinstance(data, dict):
+        raise ValueError("文件内容不是有效的参数配置（顶层应为对象）")
+    if data.get("format_version") != 1:
+        raise ValueError("文件版本不受支持或已损坏（format_version 应为 1）")
+    raw = data.get("processors")
+    if not isinstance(raw, list):
+        raise ValueError("文件内容不完整：缺少 processors 列表")
+    for i, p in enumerate(raw):
+        if not isinstance(p, dict):
+            raise ValueError(f"第 {i + 1} 个处理器不是有效对象")
+        for key, cast in (("blur_size", int), ("erode_size", int), ("dilate_size", int)):
+            if key in p:
+                try:
+                    cast(p[key])
+                except (TypeError, ValueError):
+                    raise ValueError(f"第 {i + 1} 个处理器的 {key} 不是有效数值")
+        for key, cast in (("roi_norm", float), ("lower", int), ("upper", int)):
+            vals = p.get(key)
+            if vals is None:
+                continue
+            if not isinstance(vals, list):
+                raise ValueError(f"第 {i + 1} 个处理器的 {key} 应为列表")
+            for v in vals:
+                try:
+                    cast(v)
+                except (TypeError, ValueError):
+                    raise ValueError(f"第 {i + 1} 个处理器的 {key} 含非法数值")
+        fr = p.get("filter_rules")
+        if fr is not None and not isinstance(fr, list):
+            raise ValueError(f"第 {i + 1} 个处理器的 filter_rules 应为列表")
+
+
 def load_state_file(path):
-    """读取参数文件并重建 (GlobalConfig, list[ProcessorConfig])。"""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    """读取参数文件并重建 (GlobalConfig, list[ProcessorConfig])。
+
+    文件缺失/不可读/JSON 损坏/结构损坏或版本不兼容时抛 ValueError（中文提示），
+    由调用方捕获后弹出警告窗口。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"文件不是有效的 JSON：第 {e.lineno} 行 {e.msg}") from e
+    except UnicodeDecodeError:
+        raise ValueError("文件不是有效的 UTF-8 文本，可能已损坏") from None
+    except OSError as e:
+        raise ValueError(f"无法读取文件：{e}") from e
+    _validate_state(data)
     return state_from_dict(data)

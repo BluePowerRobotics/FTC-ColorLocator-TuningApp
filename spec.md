@@ -44,6 +44,8 @@ app/
   widgets.py               # 可复用 Qt 控件
   main_window.py           # 主窗口控制器（导航/时序/Processor 管理）
   pages.py                 # 7 个向导页面 + 页面基类 + 绘制辅助函数
+tests/
+  test_smoke.py            # 单元测试：config 序列化/合并/损坏校验、pipeline 冒烟
 ```
 
 分层设计：视觉算法（`pipeline`）与 UI（Qt）解耦；代码生成（`codegen`）独立于算法；
@@ -140,13 +142,20 @@ app/
 - `state_to_dict(global_cfg, processors) -> dict`：扁平 JSON 结构
   `{"format_version": 1, "global": 4 个调参字段, "processors": [asdict(p)…]}`，
   排除运行时字段 `teaching_mode`/`page_index`。
+- `ensure_odd(n)`：把 blurSize 规整为不小于 1 的奇数（OpenCV 高斯核偶数会抛异常）。
+- `_fixed_list(vals, default, n, cast)`：把列表补齐/截断到固定长度（不足用 `default` 循环补齐），
+  杜绝损坏文件字段长度不足导致的崩溃。
 - `state_from_dict(data) -> (GlobalConfig, list[ProcessorConfig])`：缺失字段用默认值回退、
-  阈值/尺寸转类型、`processors` 为空回退 `[default_processor(1)]`。
+  `roi_norm/lower/upper` 经 `_fixed_list` 补齐/截断、`blur_size` 经 `ensure_odd` 规整奇数、
+  `processors` 为空回退 `[default_processor(1)]`。
 - `merge_processors(existing, incoming)`：以 `existing` 为宿主追加 `incoming`，
   名字冲突自动加 `_2/_3/…` 后缀（先 `clone` 深拷贝再改名）。
 - `merge_global(host, guest)`：合并时取较大分辨率（`min(downsample_rate)`），其余沿用宿主。
 - `save_state_file(path, …)`：先写 `path + ".tmp"` 再 `os.replace` 原子替换。
-- `load_state_file(path)`：读 JSON → `state_from_dict`。
+- `_validate_state(data)`：加载前校验结构——顶层为对象、`format_version == 1`、`processors`
+  为列表、各字段类型/数值合法；损坏抛中文 `ValueError`。
+- `load_state_file(path)`：读 JSON → `_validate_state` → `state_from_dict`；捕获
+  `JSONDecodeError`/`UnicodeDecodeError`/`OSError` 并转中文 `ValueError`（含行号/原因）。
 
 ---
 
@@ -259,13 +268,19 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 
 **文件操作**（`config.py` 序列化 + `main_window.py` 对话框）：
 - `open_file()`：选 `.clp` → 覆盖 `global_cfg`/`processors` → 设 `current_file_path` → `_apply_loaded_state()`。
-- `open_merge()`：选文件 → 把其处理器经 `merge_processors` 追加为**新 Processor**，全局经
-  `merge_global` 取较大分辨率（其余保留当前）；不改 `current_file_path`。仅菜单。
+- `open_merge()`：选文件 → 先 `_confirm_merge_resolution` 校验分辨率 → 把其处理器经
+  `merge_processors` 追加为**新 Processor**、全局经 `merge_global` 取较大分辨率（其余保留当前）；
+  不改 `current_file_path`。仅菜单。
 - `save_file()`：`current_file_path` 有值则原地写，否则转 `save_file_as()`。
 - `save_file_as()`：另存为 `.clp`（默认名 `color_params.clp`、缺后缀自动补），成功后更新 `current_file_path`。
-- `save_merge_to()`：选已有 `.clp` → 全局经 `merge_global` 取较大分辨率（其余保留该文件）、把当前处理器
-  追加进文件并原子写回 → 将合并结果加载为当前状态。仅菜单。
+- `save_merge_to()`：选已有 `.clp` → 先 `_confirm_merge_resolution` 校验分辨率 → 全局经
+  `merge_global` 取较大分辨率（其余保留该文件）、把当前处理器追加进文件并原子写回 → 将合并结果
+  加载为当前状态。仅菜单。
 - 加载后统一 `_apply_loaded_state()`：页面 1 同步降采样率、页面 2..6 重建参数组 → `_run_pipeline()`。
+- 合并分辨率警告：`_confirm_merge_resolution(host_dsr, guest_dsr)`——`downsample_rate` 相同则返回
+  True；不同则弹 `QMessageBox` 警告「自动合并可能导致参数失效」，默认聚焦「取消」按钮，另有
+  「仍要自动合并」。选「取消」返回 False（调用方直接 return，无任何状态/文件改动）；选
+  「仍要自动合并」才继续合并取大分辨率。
 
 ### 6.2 向导页面（7 页，`PAGE_CLASSES`）
 
@@ -309,7 +324,8 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
   - `set_range()` 动态改范围/步长（供过滤规则按指标切换）；`set_value_silent()` 仅同步显示不发射信号。
 - **`OptionBox`**：标签 + 下拉框，`changed` 信号，`set_value(v, silent)` 静默设置。
 - **`ThresholdGroupCard`**：色空间下拉 + 6 个阈值滑条；切换色空间时按
-  `COLOR_SPACE_META` 更新通道名与范围；`load(proc)`/`write(proc)` 与 `ProcessorConfig` 互转。
+  `COLOR_SPACE_META` 更新通道名与范围（统一调用 `SliderSpin.set_range`，无重复私有实现）；
+  `load(proc)`/`write(proc)` 与 `ProcessorConfig` 互转。
 - **`ImageView`**：`contain` 方式居中显示（letterbox 留白），背景深色；`paintEvent`
   绘制；`mouseMoveEvent` 把控件坐标反算回原始图像坐标并发 `hover_moved(x,y)` 信号。
 
@@ -317,13 +333,16 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 - 图片：`QFileDialog` + `cv2.imread` 改为 **`cv2.imdecode`** 读取字节流，以兼容 Windows
   上含中文/非 ASCII 的路径。
 - 摄像头：`Camera` 可**按索引打开**，`CAP_DSHOW` 优先、失败回退默认后端，并**默认使用
-  最大分辨率**（`_max_resolution` 设超大值读回驱动钳制结果，读取失败回退 1280×720）。
-  **独立 daemon 线程**持续读帧、用锁保护、`latest_frame()` 返回副本。
+  最大分辨率**（`_max_resolution` 设超大值读回驱动钳制结果；读取失败或驱动未钳制、返回值
+  ≥10000 时回退 1280×720）。**独立 daemon 线程**持续读帧、用锁保护、`latest_frame()` 返回副本；
+  `read()` 与 `release()` 用 `_read_lock` 互斥，避免释放时线程仍阻塞在 read 上。
   支持「冻结画面」冻结当前帧进行精细调参。
 - 摄像头选择：`enumerate_cameras()` 遍历索引 0~7（`CAP_DSHOW` 优先）返回可用设备与最大分辨率。
   打开摄像头时——无设备则 `QMessageBox` 警告；仅 1 个则直接打开；多个则 `QInputDialog` 弹出
   选择框（显示「摄像头 N（宽×高）」），选定后 `start_camera(index)` 打开对应设备；
   再次点击「打开摄像头」前会先 `_stop_camera()` 释放旧设备，避免枚举时与占用中的摄像头并发打开而卡死。
+- 摄像头选择用 `(index, label)` 成对列表按索引映射，避免同分辨率设备因 `labels.index` 重名而选错。
+- `start_camera(index)` 无条件先 `_stop_camera()` 再重建，确保切换索引不会复用旧设备。
 - 选图或开摄像头后自动跳转到第 1 页。
 
 ### 6.6 教学模式
@@ -353,6 +372,10 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 - **ROI**：整帧 → `ImageRegion.entireFrame()`；归一化 →
   `ImageRegion.asUnityCenterCoordinates(uMin, vMin, uMax, vMax)`（字段顺序已按官方 API 对齐）。
 - `_fmt`：浮点格式化为最简字符串（去尾零，`-0`→`0`），用于 ROI 与过滤阈值。
+- 输出头部附 `import` 注释块（`java.util.ArrayList/List`、`WebcamName`、`Size`、`SortOrder`、
+  `VisionPortal`、`ColorBlobLocatorProcessor`/`ColorRange`/`ColorSpace`/`ImageRegion`、`RotatedRect`）。
+- `setBlurSize` 输出 `ensure_odd(blur_size)` 规整后的奇数；圆形拟合用全限定名
+  `ColorBlobLocatorProcessor.Circle`（CBLP 内部类，裸类名 `Circle` 无法解析）。
 
 ---
 
@@ -384,6 +407,15 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
     `setChildrenCollapsible(False)`。
 18. **排名数字标注面积阈值**：`_MIN_LABEL_AREA_RATIO = 0.1`，面积不足最大色块 10% 的色块不标数字，
     高亮拟合色块亦不标；轮廓排名配色保留不变。
+19. **合并分辨率警告**：`downsample_rate` 相同时静默合并；不同时先弹「自动合并可能导致参数失效」，
+    取消则撤销、确认才取大分辨率继续（`_confirm_merge_resolution`）。
+20. **加载前损坏校验**：`_validate_state` 校验 `format_version`/`processors`/字段类型与数值，
+    结构损坏或版本不符直接拒绝；`load_state_file` 把 JSON/编码/IO 异常统一转中文 `ValueError`。
+    结构合法但字段缺失/长度不足则宽容补全（`_fixed_list`），不误伤手写文件。
+21. **blurSize 强制奇数贯穿全链路**：预览 `pipeline._odd`、加载 `ensure_odd`、代码生成 `ensure_odd`
+    三处一致，避免加载偶数 blurSize 后生成 `setBlurSize(4)` 导致真机 OpenCV 崩溃。
+22. **单元测试覆盖核心纯逻辑**：`tests/test_smoke.py`（unittest）覆盖序列化往返、合并、损坏校验、
+    容错与管道冒烟，共 13 用例，入口 `python -m unittest discover -s tests`。
 
 ---
 
@@ -393,3 +425,4 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 - 预定义颜色是近似标定，可能与真机官方常量存在细微差异。
 - 参数可手动保存/加载为 `.clp` 文件（JSON），但无自动保存、无历史/撤销。
 - 摄像头默认使用最大分辨率（读回失败回退 1280×720）；无手动分辨率选择 UI，选择框仅显示索引（0~7 枚举）而非设备名。
+- 单元测试覆盖 config/pipeline 纯逻辑，但 GUI 交互与摄像头（含 DirectShow 行为）无自动化测试。

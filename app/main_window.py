@@ -184,12 +184,12 @@ class MainWindow(QMainWindow):
         self.go_to_page(1)
 
     def start_camera(self, index: int = 0):
-        if self.camera is None:
-            self.camera = Camera(index)
-            if not self.camera.open():
-                QMessageBox.warning(self, "摄像头", "无法打开所选摄像头。")
-                self.camera = None
-                return
+        self._stop_camera()
+        self.camera = Camera(index)
+        if not self.camera.open():
+            QMessageBox.warning(self, "摄像头", "无法打开所选摄像头。")
+            self.camera = None
+            return
         self.camera_mode = True
         self.frozen = False
         self._camera_timer.start()
@@ -288,6 +288,20 @@ class MainWindow(QMainWindow):
         self.current_file_path = path
         self._apply_loaded_state()
 
+    def _confirm_merge_resolution(self, host_dsr, guest_dsr):
+        """合并前检查分辨率：一致返回 True；不一致弹窗让用户选择是否仍要自动合并。"""
+        if host_dsr == guest_dsr:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("自动合并")
+        box.setText("自动合并可能导致参数失效")
+        box.setIcon(QMessageBox.Warning)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        merge_btn = box.addButton("仍要自动合并", QMessageBox.AcceptRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        return box.clickedButton() == merge_btn
+
     def open_merge(self):
         path, _ = QFileDialog.getOpenFileName(self, "打开并合并", "", C.FILE_FILTER)
         if not path:
@@ -296,6 +310,8 @@ class MainWindow(QMainWindow):
             g, ps = C.load_state_file(path)
         except Exception as e:
             QMessageBox.warning(self, "打开并合并", f"加载失败：{e}")
+            return
+        if not self._confirm_merge_resolution(self.global_cfg.downsample_rate, g.downsample_rate):
             return
         self.global_cfg = C.merge_global(self.global_cfg, g)
         self.processors = C.merge_processors(self.processors, ps)
@@ -331,6 +347,8 @@ class MainWindow(QMainWindow):
             g, exist_ps = C.load_state_file(path)
         except Exception as e:
             QMessageBox.warning(self, "另存并合并到", f"加载失败：{e}")
+            return
+        if not self._confirm_merge_resolution(g.downsample_rate, self.global_cfg.downsample_rate):
             return
         merged_global = C.merge_global(g, self.global_cfg)
         merged = C.merge_processors(exist_ps, self.processors)

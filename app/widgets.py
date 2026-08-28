@@ -219,16 +219,8 @@ class ThresholdGroupCard(QGroupBox):
             lo, hi = ranges[i]
             self._lower[i]._label.setText(f"下限 {chans[i]}")
             self._upper[i]._label.setText(f"上限 {chans[i]}")
-            self._set_range(self._lower[i], lo, hi)
-            self._set_range(self._upper[i], lo, hi)
-
-    def _set_range(self, w: SliderSpin, lo, hi):
-        w._min = lo
-        w._max = hi
-        w.spin.setRange(int(lo), int(hi))
-        steps = max(1, int(round((hi - lo) / w._step)))
-        w.slider.setRange(0, steps)
-        w.set_value_silent(w.spin.value())
+            self._lower[i].set_range(lo, hi)
+            self._upper[i].set_range(lo, hi)
 
     def load(self, proc: C.ProcessorConfig):
         self._space.set_value(proc.color_space, silent=True)

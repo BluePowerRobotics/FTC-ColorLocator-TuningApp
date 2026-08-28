@@ -42,7 +42,7 @@ def _builder(proc: C.ProcessorConfig, index: int) -> List[str]:
         f"                .setTargetColorRange({_color_range(proc)})",
         f"                .setContourMode(ColorBlobLocatorProcessor.ContourMode.{proc.contour_mode})",
         f"                .setRoi({_roi(proc)})",
-        f"                .setBlurSize({proc.blur_size})",
+        f"                .setBlurSize({C.ensure_odd(proc.blur_size)})",
         f"                .setErodeSize({proc.erode_size})",
         f"                .setDilateSize({proc.dilate_size})",
         f"                .setMorphOperationType(ColorBlobLocatorProcessor.MorphOperationType.{proc.morph_type})",
@@ -56,6 +56,19 @@ def generate_java(global_cfg: C.GlobalConfig, processors: List[C.ProcessorConfig
     ds_w, ds_h = ds_size
 
     out: List[str] = []
+    out.append("        // ===== 需要的 import（按项目模板补充）=====")
+    out.append("        // import java.util.ArrayList;")
+    out.append("        // import java.util.List;")
+    out.append("        // import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;")
+    out.append("        // import org.firstinspires.ftc.robotcore.external.navigation.Size;")
+    out.append("        // import org.firstinspires.ftc.robotcore.external.tfod.SortOrder;")
+    out.append("        // import org.firstinspires.ftc.vision.VisionPortal;")
+    out.append("        // import org.firstinspires.ftc.vision.opencv.ColorBlobLocatorProcessor;")
+    out.append("        // import org.firstinspires.ftc.vision.opencv.ColorRange;")
+    out.append("        // import org.firstinspires.ftc.vision.opencv.ColorSpace;")
+    out.append("        // import org.firstinspires.ftc.vision.opencv.ImageRegion;")
+    out.append("        // import org.opencv.core.RotatedRect;")
+    out.append("")
     out.append("        // ===== 初始化阶段 =====  （放入 runOpMode 开头）")
     out.append("        // 构建每个 ColorBlobLocatorProcessor")
     for i, proc in enumerate(processors):
@@ -108,7 +121,7 @@ def generate_java(global_cfg: C.GlobalConfig, processors: List[C.ProcessorConfig
         out.append("            double boxHeight = box.size.height;")
         out.append("            double boxAngle = box.angle;")
     else:
-        out.append("            Circle circle = firstBlob.getCircle();")
+        out.append("            ColorBlobLocatorProcessor.Circle circle = firstBlob.getCircle();")
         out.append("            double circleCenterX = circle.getX();")
         out.append("            double circleCenterY = circle.getY();")
         out.append("            double circleRadius = circle.getRadius();")

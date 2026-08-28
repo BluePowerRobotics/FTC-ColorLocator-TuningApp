@@ -21,7 +21,8 @@ def _max_resolution(cap: cv2.VideoCapture) -> tuple[int, int]:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 10000)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if w <= 0 or h <= 0:
+    # 读取失败或驱动直接接受了 10000（未钳制）时回退到常用分辨率
+    if w <= 0 or h <= 0 or w >= 10000 or h >= 10000:
         return 1280, 720
     return w, h
 
@@ -47,7 +48,8 @@ class Camera:
         self._running = False
         self._thread = None
         self._frame = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # 保护 _frame
+        self._read_lock = threading.Lock()  # 保护 read/release 互斥
 
     def open(self) -> bool:
         """打开指定摄像头（DirectShow 优先）；默认使用最大分辨率，失败回退默认后端。"""
@@ -67,7 +69,10 @@ class Camera:
 
     def _run(self):
         while self._running:
-            ok, frame = self._cap.read()
+            with self._read_lock:
+                if not self._running:
+                    break
+                ok, frame = self._cap.read()
             if ok:
                 with self._lock:
                     self._frame = frame
@@ -84,7 +89,9 @@ class Camera:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=0.6)
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
+        # 与 read 互斥，避免释放时线程仍阻塞在 read 上
+        with self._read_lock:
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
         self._frame = None
