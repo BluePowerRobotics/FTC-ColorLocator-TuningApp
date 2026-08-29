@@ -354,17 +354,27 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 
 ## 7. 代码生成（codegen.py）
 
-`generate_java(global_cfg, processors, ds_size) -> str` 输出两段 Java 代码。
+`generate_java(global_cfg, processors, ds_size) -> str` 输出**一个完整的 `ColorLocator` Java 类**
+（不再是代码片段），内部封装摄像头与 `ColorBlobLocatorProcessor`，对外提供实时结果接口。
 
-### 7.1 输出结构
-- **初始化阶段**（放 `runOpMode` 开头）：为每个 Processor 生成一个
-  `ColorBlobLocatorProcessor procN` 的 Builder 链；再用一个 `VisionPortal` 通过
-  `.addProcessor(procN)` 挂载全部；`.setCameraResolution(new Size(ds_w, ds_h))` 使用
-  **降采样后的分辨率**；`.setCamera(hardwareMap.get(WebcamName.class, "Webcam 1"))`；
-  最后 `telemetry.setMsTransmissionInterval(100)`。
-- **运行阶段**（放循环体内）：逐个 `getBlobs()`、逐条 `filterByCriteria`、用
-  `ArrayList` `addAll` 合并成 `allBlobs`、全局 `sortByCriteria`、取 `allBlobs.get(0)`
-  并按 `fit_mode` 输出 `boxFit`（center/size/angle）或 `circleFit`（x/y/radius）。
+### 7.1 类结构
+- **构造器**：`ColorLocator(HardwareMap)`（默认 `"Webcam 1"`）与 `ColorLocator(HardwareMap, String)`。
+  内部为每个 Processor 生成 `ColorBlobLocatorProcessor procN` 的 Builder 链，`addProcessor(procN)`
+  挂载到单一 `VisionPortal`，`.setCameraResolution(new Size(ds_w, ds_h))` 使用**降采样后分辨率**、
+  `.setCamera(hardwareMap.get(WebcamName.class, webcamName))`。
+- **对外接口**：
+  - `update()`：读取最新帧 → 各处理器 `getBlobs()` → 逐条 `filterByCriteria` → `addAll` 合并 →
+    全局 `sortByCriteria` → 取 `allBlobs.get(0)`；返回 `boolean` 是否找到，找不到时 `centerX/Y` 归 0。
+  - getter：`isTargetFound()` / `getCenterX()` / `getCenterY()`；按 `fit_mode` 提供
+    `getBoxWidth()/getBoxHeight()/getBoxAngle()`（boxFit）或 `getRadius()`（circleFit）。
+  - `close()`：释放 `VisionPortal`。
+- **坐标归一化（右上为正）**：拟合轮廓中心输出到 `getCenterX()/getCenterY()` 时归一化到 `[-1, 1]`，
+  画面中心 `(0, 0)`、右上角 `(1, 1)`：
+
+  ```java
+  centerX = (px / CAMERA_WIDTH) * 2.0 - 1.0;   // 右为正
+  centerY = 1.0 - (py / CAMERA_HEIGHT) * 2.0;  // 上为正（图像 y 向下，需翻转）
+  ```
 
 ### 7.2 关键映射规则
 - **颜色**：预设非「自定义」→ 直接用 `ColorRange.<PRESET>` 常量；「自定义」→
@@ -372,10 +382,132 @@ blob）→ `merged_mask = bitwise_or(各 full_mask)` → 全局 `sort_blobs` →
 - **ROI**：整帧 → `ImageRegion.entireFrame()`；归一化 →
   `ImageRegion.asUnityCenterCoordinates(uMin, vMin, uMax, vMax)`（字段顺序已按官方 API 对齐）。
 - `_fmt`：浮点格式化为最简字符串（去尾零，`-0`→`0`），用于 ROI 与过滤阈值。
-- 输出头部附 `import` 注释块（`java.util.ArrayList/List`、`WebcamName`、`Size`、`SortOrder`、
-  `VisionPortal`、`ColorBlobLocatorProcessor`/`ColorRange`/`ColorSpace`/`ImageRegion`、`RotatedRect`）。
-- `setBlurSize` 输出 `ensure_odd(blur_size)` 规整后的奇数；圆形拟合用全限定名
-  `ColorBlobLocatorProcessor.Circle`（CBLP 内部类，裸类名 `Circle` 无法解析）。
+- **import 按需生成**：`circleFit` 引入 `org.firstinspires.ftc.vision.opencv.Circle`（顶层类）；
+  `boxFit` 引入 `org.opencv.core.RotatedRect`；「自定义」预设引入 `ColorSpace`/`Scalar`；
+  `Size`→`android.util.Size`、`SortOrder`→`com.qualcomm.robotcore.util.SortOrder`（官方正确包名）。
+- `setBlurSize` 输出 `ensure_odd(blur_size)` 规整后的奇数。
+- 包名固定 `package org.firstinspires.ftc.teamcode;`，带 `TODO` 注释待用户替换。
+
+### 7.3 生成示例（RED 预设 · circleFit · 320×240）
+
+```java
+package org.firstinspires.ftc.teamcode;  // TODO: 改成你的队伍包名
+
+import android.util.Size;
+
+import com.qualcomm.robotcore.hardware.HardwareMap;
+import com.qualcomm.robotcore.util.SortOrder;
+
+import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+import org.firstinspires.ftc.vision.VisionPortal;
+import org.firstinspires.ftc.vision.opencv.Circle;
+import org.firstinspires.ftc.vision.opencv.ColorBlobLocatorProcessor;
+import org.firstinspires.ftc.vision.opencv.ColorRange;
+import org.firstinspires.ftc.vision.opencv.ImageRegion;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 色块定位器：内部封装摄像头与 ColorBlobLocatorProcessor，
+ * 对外提供实时结果接口。
+ *
+ * 用法：
+ *   ColorLocator locator = new ColorLocator(hardwareMap);
+ *   while (opModeIsActive()) {
+ *       if (locator.update()) {
+ *           double x = locator.getCenterX();  // 归一化坐标
+ *       }
+ *   }
+ */
+public class ColorLocator {
+
+    // 摄像头分辨率（已降采样，需与 VisionPortal 设置一致）
+    private static final int CAMERA_WIDTH = 320;
+    private static final int CAMERA_HEIGHT = 240;
+
+    private final List<ColorBlobLocatorProcessor> processors = new ArrayList<>();
+    private VisionPortal portal;
+
+    private boolean targetFound = false;
+    private double centerX = 0.0;   // 归一化 [-1, 1]，右为正
+    private double centerY = 0.0;   // 归一化 [-1, 1]，上为正
+    private double boxWidth = 0.0;
+    private double boxHeight = 0.0;
+    private double boxAngle = 0.0;
+    private double radius = 0.0;
+
+    public ColorLocator(HardwareMap hardwareMap) {
+        this(hardwareMap, "Webcam 1");
+    }
+
+    public ColorLocator(HardwareMap hardwareMap, String webcamName) {
+        // 构建各颜色处理器
+        ColorBlobLocatorProcessor proc0 = new ColorBlobLocatorProcessor.Builder()
+                .setTargetColorRange(ColorRange.RED)
+                .setContourMode(ColorBlobLocatorProcessor.ContourMode.EXTERNAL_ONLY)
+                .setRoi(ImageRegion.entireFrame())
+                .setBlurSize(5)
+                .setErodeSize(0)
+                .setDilateSize(0)
+                .setMorphOperationType(ColorBlobLocatorProcessor.MorphOperationType.CLOSING)
+                .build();
+        processors.add(proc0);
+
+        // 封装摄像头：把所有处理器挂到同一个 VisionPortal
+        VisionPortal.Builder builder = new VisionPortal.Builder()
+                .addProcessor(proc0)
+                .setCameraResolution(new Size(CAMERA_WIDTH, CAMERA_HEIGHT))
+                .setCamera(hardwareMap.get(WebcamName.class, webcamName));
+        portal = builder.build();
+    }
+
+    /**
+     * 读取最新一帧并计算目标色块，返回是否找到。
+     * 拟合轮廓中心坐标会被归一化到 [-1, 1]，以右上为正：
+     * x 向右增大、y 向上增大，画面中心为 (0, 0)。
+     */
+    public boolean update() {
+        List<ColorBlobLocatorProcessor.Blob> allBlobs = new ArrayList<>();
+
+        // 处理器 0：读取并按规则过滤
+        List<ColorBlobLocatorProcessor.Blob> blobs0 = processors.get(0).getBlobs();
+        allBlobs.addAll(blobs0);
+
+        // 全局排序
+        ColorBlobLocatorProcessor.Util.sortByCriteria(
+                ColorBlobLocatorProcessor.BlobCriteria.BY_CONTOUR_AREA,
+                SortOrder.DESCENDING, allBlobs);
+
+        if (allBlobs.isEmpty()) {
+            targetFound = false;
+            centerX = 0.0;
+            centerY = 0.0;
+            return false;
+        }
+
+        targetFound = true;
+        ColorBlobLocatorProcessor.Blob first = allBlobs.get(0);
+        Circle circle = first.getCircle();
+        // 归一化到 [-1, 1]：x 向右为正、y 向上为正
+        centerX = (circle.getX() / CAMERA_WIDTH) * 2.0 - 1.0;
+        centerY = 1.0 - (circle.getY() / CAMERA_HEIGHT) * 2.0;
+        radius = circle.getRadius();
+        return true;
+    }
+
+    public boolean isTargetFound() { return targetFound; }
+    public double getCenterX() { return centerX; }
+    public double getCenterY() { return centerY; }
+    public double getRadius() { return radius; }
+
+    public void close() {
+        if (portal != null) {
+            portal.close();
+        }
+    }
+}
+```
 
 ---
 
